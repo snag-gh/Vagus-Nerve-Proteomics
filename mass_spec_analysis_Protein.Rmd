@@ -1,0 +1,242 @@
+---
+title: "mass spec data analysis from Proteins"
+author: "Sushma Nagaraj"
+date: "1/5/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(here)
+  library(vsn)
+  library(preprocessCore)
+  library(factoextra)
+  library(limma)
+  library(reshape2)
+  library(ggplot2)
+  library(RColorBrewer)
+  library(ggrepel)
+})
+```
+
+```{r}
+dat <- read.csv(here("data", "Protein_raw_12_20_2021.copy.csv"), header = TRUE)
+prot <- dat[,25:40]
+colnames(prot) <- gsub("..Sample.*$", "", gsub("Abundance..F1..", "", colnames(prot)))
+rownames(prot) <- dat$Accession
+
+samples <- read.table(here("data", "sample_info.txt"), header = TRUE, sep = "\t")
+samples$Region <- factor(samples$Region)
+
+prot <- prot[,samples$Sample]
+#prot.na <- which(rowSums(is.na(prot)) != 0) #All samples are NA for these proteins
+prot <- prot[which(rowSums(is.na(prot)) == 0), ] #Discard proteins that have NA for all samples
+
+all(samples$Sample == colnames(prot))
+
+barplot(table(dat$X..Unique.Peptides), ylim = c(0, 2000), main = "numbers of unique peptides matched to proteins", xlab = "# peptides matched", ylab = "# of proteins")
+```
+
+#Which proteins are being discarded? and why?
+```{r}
+discarded <- fData(qnt)[fData(qnt)$Master.Protein.Accessions %in% names(prot.na), ] #PSM level data for the discarded proteins.
+
+#> prot.na[!names(prot.na) %in% fData(qnt)$Master.Protein.Accessions] 15 proteins marked NA for all samples (and discarded from further analysis) are not in 'discarded' as they either did not match Master.Protein.Accessions exactly or were filtered out from qnt object earlier (PSM abundances were NA for all samples). Proteome Discoverer marked these proteins NA for all samples for the following reasons -
+#NP_001264805.1 NP_071709.3 NP_598424.2 XP_030109925.1 NP_001349066.1 NP_033475.1 XP_036014509.1 NP_690029.2 XP_006522695.1 NP_001355346.1 NP_083949.2 #No PSM with unique match to protein
+#XP_036010580.1 NP_001074832.2 NP_001001180.2 NP_001346255.1 #No S/N abundance values for the PSMs
+
+ggplot(discarded, aes(x = Isolation.Interference...., y = Average.Reporter.S.N)) + geom_point()        
+ggplot(discarded, aes(x = Isolation.Interference...., y = Average.Reporter.S.N)) + geom_point() + coord_cartesian(ylim = c(0, 25))
+
+discarded[discarded$`Isolation.Interference....` < 25 & discarded$Average.Reporter.S.N > 5, "Master.Protein.Accessions"] #Why did these get discarded?
+unique(discarded[discarded$`Isolation.Interference....` < 25 & discarded$Average.Reporter.S.N > 5, "Master.Protein.Accessions"])
+# [1] "XP_006515693.1" "NP_659075.1"    "XP_017176967.1" "XP_006528979.1" "XP_006507967.1" "XP_017177549.1"
+# [7] "NP_001156983.1" "XP_017171904.1" "NP_598811.3"    "NP_149026.1"    "NP_001157059.1" "NP_001108135.1"
+
+```
+
+```{r}
+cols <- brewer.pal(4, "Set2")
+names(cols) <- levels(samples$Region)
+plot(density(log2(prot[,1] + 1)), col = cols[samples$Region[1]])
+for (i in 2:ncol(prot)) {
+  lines(density(log2(prot[,i] + 1)), col = cols[samples$Region[i]])
+}
+legend(15, 0.1, names(cols), col = cols, lty = 1, cex = 0.8)
+
+#log2 and quantile normalization
+#prot <- log2(prot + 1)
+#prot.norm <- normalize.quantiles(as.matrix(prot))
+#colnames(prot.norm) <- colnames(prot)
+#rownames(prot.norm) <- rownames(prot)
+
+#vsn normalization
+prot.norm <- justvsn(as.matrix(prot))
+meanSdPlot(prot.norm)
+
+plot(density(prot.norm[,1]), col = cols[samples$Region[1]])
+for (i in 2:ncol(prot.norm)) {
+  lines(density(prot.norm[,i]), col = cols[samples$Region[i]])
+}
+legend(15, 0.1, names(cols), col = cols, lty = 1, cex = 0.8)
+
+#pdf(here("PD_Protein_abundances_analysis", "density_plots.VSN.pdf"), width = 15)
+par(mfrow = c(1,2))
+plot(density(prot[,1]), col = cols[samples$Region[1]])
+for (i in 2:ncol(prot)) {
+  lines(density(prot[,i]), col = cols[samples$Region[i]])
+}
+legend(15, 0.1, names(cols), col = cols, lty = 1, cex = 0.8)
+plot(density(prot.norm[,1]), col = cols[samples$Region[1]], main = "Vsn normalization")
+for (i in 2:ncol(prot.norm)) {
+  lines(density(prot.norm[,i]), col = cols[samples$Region[i]])
+}
+legend(15, 0.1, names(cols), col = cols, lty = 1, cex = 0.8)
+#dev.off()
+```
+
+```{r}
+prot.pca <- prcomp(t(prot.norm), scale = TRUE)
+fviz_eig(prot.pca)
+fviz_pca_var(prot.pca)
+pdf(here("PD_Protein_abundances_analysis", "PCA.pdf"))
+fviz_pca_ind(prot.pca, habillage = samples$Region, repel = TRUE)
+fviz_pca_ind(prot.pca, habillage = samples$RegionLR, repel = TRUE)
+fviz_pca_ind(prot.pca, habillage = samples$BioRep, repel = TRUE)
+dev.off()
+fviz_pca_ind(prot.pca, axes = c(2,3), habillage = samples$Region, repel = TRUE)
+fviz_pca_ind(prot.pca, axes = c(3, 4), habillage = samples$Region, repel = TRUE)
+
+pdf(here("PD_Protein_abundances_analysis", "Right-vs-Left", "PCA_plots.pdf"))
+lapply(levels(samples$Region), function(x) {
+lr.pca <- prcomp(t(prot.norm[,colnames(prot.norm) %in% samples$Sample[samples$Region == x]]))
+print(fviz_pca_ind(lr.pca, habillage = samples$RegionLR[samples$Region == x], repel = TRUE, title = paste0(x, " Left vs Right")))
+print(fviz_pca_ind(lr.pca, habillage = samples$BioRep[samples$Region == x], repel = TRUE, title = paste0(x, " Biological replicates")))
+})
+dev.off()
+```
+
+#Limma comparison between groups
+```{r}
+design <- model.matrix(~0+samples$Region)
+rownames(design) <- samples$Sample
+colnames(design) <- gsub("samples\\$Region", "", colnames(design))
+fit <- lmFit(prot.norm, design)
+contrast.matrix <- makeContrasts(Prox-Nod, Dis-Nod, Gas-Nod, Prox-Dis, Prox-Gas, Dis-Gas, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+results <- decideTests(fit2)
+topTable(fit2, number = 30)
+all_groups_res <- topTable(fit2, number = Inf)
+all_groups_res0.05 <- all_groups_res[all_groups_res$adj.P.Val <= 0.05, ]
+
+dat1 <- dat[,1:24]
+dat1 <- dat1[dat1$Accession %in% rownames(all_groups_res0.05), ]
+rownames(dat1) <- dat1$Accession
+dat1 <- dat1[rownames(all_groups_res0.05), ]
+all(rownames(dat1) == rownames(all_groups_res0.05))
+all_groups_res0.05_ann <- cbind(all_groups_res0.05, dat1) 
+write.csv(all_groups_res0.05_ann, file = here("PD_Protein_abundances_analysis", "all_groups_res0.05.csv"))
+
+
+Prox.Gas <- topTable(fit2, coef=5, adjust="BH", number = Inf, sort.by = "none")
+res.list <- lapply(1:ncol(contrast.matrix), function(x){topTable(fit2, coef=x, adjust="BH", number = Inf, sort.by = "none")})
+names(res.list) <- colnames(contrast.matrix)
+lapply(res.list, function(res) {hist(res$P.Value)})
+res.all <- do.call(cbind, res.list)
+
+res.all.sub <- res.all[rownames(res.all) %in% rownames(all_groups_res0.05_ann), ]
+res.all.sub <- res.all.sub[rownames(all_groups_res0.05_ann), ]
+
+all(rownames(res.all.sub) == rownames(all_groups_res0.05_ann))
+
+all_groups_res0.05_ann <- cbind(all_groups_res0.05_ann, res.all.sub)
+write.csv(all_groups_res0.05_ann, file = here("PD_Protein_abundances_analysis", "all_groups_res0.05.pair_wise_tests_added.csv"))
+
+mydat <- as.data.frame(results)
+mydat <- abs(mydat)
+mydat <- mydat[which(rowSums(mydat) > 0), ]
+pdf(here("PD_Protein_abundances_analysis", "upset_plot.pdf"))
+upset(mydat, nsets = 6, order.by = "freq")
+dev.off()
+```
+
+#Limma comparison between Left and right 
+```{r}
+Region <- "Nod"
+Region <- "Prox"
+Region <- "Dis"
+Region <- "Gas"
+
+samples.sub <- samples[samples$Region == Region, ]
+prot.norm.sub <- prot.norm[,colnames(prot.norm) %in% samples.sub$Sample]
+lr.pca <- prcomp(t(prot.norm.sub), scale = TRUE)
+fviz_pca_ind(lr.pca, habillage = samples.sub$RegionLR[samples.sub$Region == Region], repel = TRUE, title = paste0(Region, " Left vs Right"))
+fviz_pca_ind(lr.pca, habillage = samples.sub$BioRep[samples.sub$Region == Region], repel = TRUE, title = paste0(Region, " Biological replicates"))
+
+#Right vs Left
+#design <- model.matrix(~BioRep + RegionLR, data = samples.sub) #Dis, Nod
+design <- model.matrix(~RegionLR, data = samples.sub) #Prox, Gas
+rownames(design) <- samples.sub$Sample
+design
+fit <- lmFit(prot.norm.sub, design)
+fit2 <- eBayes(fit)
+results <- decideTests(fit2)
+summary(results)
+#res <- topTable(fit2, coef = 3, number = Inf) #Dis, Nod (When BioRep used as a covariate)
+res <- topTable(fit2, coef = 2, number = Inf) #Prox, Gas
+hist(res$P.Value)
+
+plot(res$AveExpr, res$logFC)
+
+res0.01 <- res[res$P.Value <= 0.01, ]
+dat1 <- dat[,1:24]
+dat1 <- dat1[dat1$Accession %in% rownames(res0.01), ]
+rownames(dat1) <- dat1$Accession
+dat1 <- dat1[rownames(res0.01), ]
+all(rownames(dat1) == rownames(res0.01))
+res0.01 <- cbind(res0.01, dat1) 
+
+res0.01$Accession <- rownames(res0.01)
+pdf(here("PD_Protein_abundances_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.plots.pdf")))
+hist(res$P.Value, main = paste0(Region, " Right-vs-Left"))
+ggplot(res0.01, aes(x = logFC, y = -log10(P.Value), label = Gene.Symbol))  +  geom_point() + geom_text_repel() + theme_classic() + ggtitle(paste0(Region, " Right-vs-Left"))
+dev.off()
+
+write.csv(res0.01, here("PD_Protein_abundances_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.csv")))
+
+```
+
+```{r}
+gastric_genes <- c("NP_062268.1", "NP_059095.1", "NP_057877.1", "NP_659152.1", "XP_006527635.1", "NP_073559.3", "NP_034451.1", "NP_062287.1", "XP_006523612.1", "NP_032803.2", "NP_034486.2", "NP_032303.1", "NP_034489.1", "XP_006523526.1", "NP_033493.3", "XP_006518513.1", "NP_058051.3", "NP_032795.1", "NP_031435.1", "XP_006498388.1", "NP_031841.3", "XP_036020343.1", "NP_085114.1", "NP_032497.1", "NP_848828.1", "NP_996260.1", "NP_941074.1", "NP_932147.2", "XP_030104738.1")
+
+gastric_genes_lower <- c("NP_031683.1", "NP_038673.2", "XP_006539729.1", "XP_006500450.1", "NP_034304.1", "NP_031736.1", "XP_036016906.1", "XP_006532224.1", "NP_080661.1", "NP_035034.2", "NP_001025476.1", "NP_001302429.1", "NP_001033679.1", "NP_001230235.1", "XP_006513538.1", "XP_006528559.1", "NP_035354.1", "NP_031530.2", "NP_034053.2", "XP_036013201.1", "NP_001346046.1", "NP_001028446.2", "XP_036010485.1", "NP_084091.2", "XP_030098049.1", "NP_067490.1", "XP_036010229.1", "NP_061358.1", "XP_006532475.1")
+
+pdf(here("PD_Protein_abundances_analysis", "Proteins_with_higher_exp_in_gastric_regions.pdf"), width = 10)
+myplot(gastric_genes, "Proteins_with_higher_exp_in_gastric_regions")
+dev.off()
+
+pdf(here("PD_Protein_abundances_analysis", "Proteins_with_lower_exp_in_gastric_region.pdf"), width = 10)
+myplot(gastric_genes_lower, "Proteins_with_lower_exp_in_gastric_regions")
+dev.off()
+
+myplot <- function(genes, title) {
+  mydat <- prot.norm[genes, ]
+  mydat <- as.data.frame(mydat)
+  mydat$Protein <- rownames(mydat)
+  mydat_long <- melt(mydat)
+  colnames(mydat_long) <- c("Protein", "Sample", "normalized_exp")
+  mydat_long$Region <- samples[match(mydat_long$Sample, samples$Sample), "Region"]
+  mydat_long$Gene <- dat[match(mydat_long$Protein, dat$Accession), "Gene.Symbol"]
+  mydat_long$Gene_name <- paste0(mydat_long$Protein, "_", mydat_long$Gene)
+  #pdf(here("PD_Protein_abundances_analysis", "Proteins_with_higher_exp_in_gastric_regions.pdf"))
+  ggplot(mydat_long, aes(x = Region, y = normalized_exp, col = Region)) + geom_boxplot(outlier.shape = NA) + geom_point(aes(x =Region, y = normalized_exp), size = 0.7)+ facet_wrap(~Gene_name) + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + ggtitle(title) 
+  #dev.off()
+}
+```
+
+
+
+

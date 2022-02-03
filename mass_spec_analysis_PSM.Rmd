@@ -1,0 +1,367 @@
+---
+title: "mass_spec_data_analysis"
+author: "Sushma Nagaraj"
+date: "1/4/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(here)
+  library(MSnbase)
+  library(ggplot2)
+  library(RColorBrewer)
+  library(vsn)
+  library(factoextra)
+  library(gplots)
+  library(reshape2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(UpSetR)
+  library(limma)
+  library(ggrepel)
+})
+source(here("src", "vagus_nerve_proteomics", "functions.R"))
+```
+
+```{r}
+csv <- here("data", "PSM_raw_12-22-21.copy.csv")
+getEcols(csv, split = ",")
+ecols <- 19:34
+res <- readMSnSet2(csv, ecols)
+head(exprs(res))
+head(fData(res))
+colnames(res) <- gsub("Abundance..", "", colnames(res))
+
+samples <- read.table(here("data", "sample_info.txt"), header = TRUE, sep = "\t")
+all(colnames(res) == samples$Sample)
+rownames(samples) <- samples$Sample
+pData(res) <- samples
+
+#fData(res)$Master.Protein.Accessions <- gsub(";", " ", fData(res)$Master.Protein.Accessions)
+dat <- read.csv(here("data", "Protein_raw_12_20_2021.copy.csv"), header = TRUE)
+```
+
+#Filtering
+```{r}
+#Filter out any Average S/N that are NA. There are no abundances for such PSMs.
+qnt <- res[! is.na(fData(res)$Average.Reporter.S.N), ]
+
+#Additional filtering
+qnt <- qnt[fData(qnt)$Isolation.Interference.... <= 30, ] #Isolation interference threshold
+#Signal to noise threshold
+qnt <- qnt[fData(qnt)$Average.Reporter.S.N >= 3, ] 
+qnt <- qnt[fData(qnt)$Master.Protein.Accessions != "", ] #Filter out any PSMs without a protein accession.
+nonspecific <- grep(";", fData(qnt)$Master.Protein.Accessions) #Filter out any PSMs matched to multiple proteins and use only unique matches for quantification.
+qnt <- qnt[-nonspecific, ]
+qnt <- qnt[fData(qnt)$Search.Engine.Rank == 1, ]
+```
+
+#Normalization
+```{r}
+qnt$Region <- factor(qnt$Region)
+qnt$RegionLR <- factor(qnt$RegionLR)
+#pdf(here("PD_PSM_level_analysis", "PSM_Normalization.pdf"))
+density_plot(qnt, "no normalization", log = TRUE)
+density_plot(qnt, "no normalization", log = TRUE, facet = FALSE)
+
+qnt.vsn <- normalise(qnt, "vsn")
+meanSdPlot(exprs(qnt.vsn))
+density_plot(qnt.vsn, "VSN normalization")
+density_plot(qnt.vsn, "VSN normalization", facet = FALSE)
+#dev.off()
+```
+
+```{r}
+qnt.vsn <- nFeatures(qnt.vsn, "Annotated.Sequence")
+peptides <- combineFeatures(qnt.vsn, groupBy = fData(qnt.vsn)$Annotated.Sequence, method = "median", redundancy.handler = "unique", na.rm = TRUE)
+peptides <- nFeatures(peptides, "Master.Protein.Accessions")
+#pdf(here("PD_PSM_level_analysis", "Protein_Normalization.pdf"))
+density_plot(peptides, "abundances aggregated to peptide level")
+density_plot(peptides, "abundances aggregated to peptide level", facet = FALSE)
+
+proteins <- combineFeatures(peptides, groupBy = fData(peptides)$Master.Protein.Accessions, method = "median", redundancy.handler = "unique", na.rm = TRUE)
+density_plot(proteins, "abundances aggregated to protein level")
+density_plot(proteins, "abundances aggregated to protein level", facet = FALSE)
+
+proteins.norm <- normalise(proteins, "quantiles")
+density_plot(proteins.norm, "abundances aggregated to protein level, quantile normalized")
+density_plot(proteins.norm, "abundances aggregated to protein level, quantile normalized", facet = FALSE)
+#dev.off()
+```
+
+#How many proteins have support from only a single peptide?
+```{r}
+#pdf(here("PD_PSM_level_analysis", "Number_of_unique_peptides_mapped_to_proteins.barplot.pdf"))
+barplot(table(fData(proteins.norm)$Master.Protein.Accessions.nFeatures), ylim = c(0,2000), main = "numbers of unique peptides matched to proteins", xlab = "# peptides matched", ylab = "# of proteins")
+#dev.off()
+```
+
+#Exploration of NA's in the dataset
+```{r}
+#pdf(here("PD_PSM_level_analysis", "Explore_NA_values.barplots.pdf"))
+cols <- brewer.pal(4, "Set2")
+names(cols) <- levels(proteins.norm$Region)
+barplot(colSums(is.na(exprs(proteins.norm))), col = cols[proteins.norm$Region], las = 2, main = "NA distribution by sample", ylab = "# of NA's")
+legend(17, 400, names(cols), col = cols, lty = 1, cex = 0.8)
+cols <- c("seagreen3", "dodgerblue4")
+proteins.norm$BioRep <- as.factor(proteins.norm$BioRep)
+names(cols) <- levels(proteins.norm$BioRep)
+barplot(colSums(is.na(exprs(proteins.norm))), col = cols[proteins.norm$BioRep], las = 2, main = "NA distribution by sample", ylab = "# of NA's")
+legend(17, 400, names(cols), col = cols, lty = 1, cex = 0.8)
+
+barplot(table(rowSums(is.na(exprs(proteins.norm)))), xlab = "# of NA's", ylab = "# of proteins", main = "NA distribution by protein")
+#dev.off()
+
+rows.with.na <- exprs(proteins.norm)[rowSums(is.na(exprs(proteins.norm))) > 0, ]
+sample.order <- c("129C", "133C", "130N", "134N", "126", "130C", "127N", "131N", "127C", "131C", "128N", "132N", "128C", "132C", "129N", "133N")
+rows.with.na <- rows.with.na[,sample.order]
+rows.with.na[!is.na(rows.with.na)] <- 1
+rows.with.na[is.na(rows.with.na)] <- 0
+
+ann <- pData(proteins.norm)
+ann <- ann[sample.order, ]
+set.seed(111)
+column_ha <- HeatmapAnnotation(Regions = ann$Region, RegionLR = ann$RegionLR, BioRep = as.factor(ann$BioRep))
+#pdf(here("PD_PSM_level_analysis", "Explore_NA_values.heatmap.pdf"))
+Heatmap(rows.with.na, col = colorRamp2(c(0, 1), c("white", "black")), top_annotation = column_ha, cluster_columns = FALSE, show_row_names = FALSE)
+#dev.off()
+```
+
+#Check overlap with final list of proteins reported by Proteome Discoverer analysis.
+```{r}
+venn(list(PD.proteins = rownames(prot), PD.PSM.aggregated.to.proteins = rownames(exprs(proteins.norm)))) 
+
+```
+
+#PCA
+```{r}
+#Remove any Proteins that were not detected by all samples as PCA will not work with NA's. 
+forPCA <- filterNA(proteins.norm) 
+any(is.na(forPCA))
+prot.pca <- prcomp(t(exprs(forPCA)), scale = TRUE)
+#pdf(here("PD_PSM_level_analysis", "PCA_plots.pdf"))
+fviz_pca_ind(prot.pca, habillage = samples$Region, repel = TRUE)
+fviz_pca_ind(prot.pca, habillage = samples$RegionLR, repel = TRUE)
+fviz_pca_ind(prot.pca, habillage = samples$BioRep, repel = TRUE)
+#dev.off()
+```
+#For comparison between groups, filter any proteins that are not expressed in atleast 3 samples in each group.
+```{r}
+proteins.norm.F <- filter_valids(proteins.norm,
+                     groups = levels(proteins.norm$Region),
+                     min_count = c(3, 3, 3, 3),
+                     at_least_one = TRUE)
+```
+
+#Limma comparison between groups
+```{r}
+#Limma
+design <- model.matrix(~0+proteins.norm.F$Region)
+rownames(design) <- samples$Sample
+colnames(design) <- gsub("proteins.norm.F\\$Region", "", colnames(design))
+fit <- lmFit(exprs(proteins.norm.F), design)
+contrast.matrix <- makeContrasts(Prox-Nod, Dis-Nod, Gas-Nod, Prox-Dis, Prox-Gas, Dis-Gas, levels = design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+results <- decideTests(fit2)
+summary(results)
+topTable(fit2, number = 30)
+all_groups_res <- topTable(fit2, number = Inf)
+all_groups_res0.05 <- all_groups_res[which(all_groups_res$adj.P.Val <= 0.05), ]
+
+#Add protein annotation provided by Proteome discoverer. 
+dat1 <- dat[,c(1,2,4,5:10,14:23)]
+colnames(dat1) <- gsub("\\.", "", colnames(dat1))
+dat1 <- dat1[dat1$Accession %in% rownames(all_groups_res0.05), ]
+rownames(dat1) <- dat1$Accession
+dat1 <- dat1[rownames(all_groups_res0.05), ]
+all(rownames(dat1) == rownames(all_groups_res0.05))
+all_groups_res0.05_ann <- cbind(all_groups_res0.05, dat1) 
+all_groups_res0.05_ann$XPeptides.new <- fData(proteins.norm.F)[match(rownames(all_groups_res0.05_ann), rownames(fData(proteins.norm.F))), "Master.Protein.Accessions.nFeatures"] 
+
+#Add pairwise t-test results.
+#Prox.Gas <- topTable(fit2, coef=5, adjust="BH", number = Inf, sort.by = "none")
+res.list <- lapply(1:ncol(contrast.matrix), function(x) topTable(fit2, coef=x, adjust="BH", number = Inf, sort.by = "none"))
+names(res.list) <- colnames(contrast.matrix)
+lapply(res.list, function(res) {hist(res$P.Value)})
+res.all <- do.call(cbind, res.list)
+
+res.all.sub <- res.all[rownames(res.all) %in% rownames(all_groups_res0.05_ann), ]
+res.all.sub <- res.all.sub[rownames(all_groups_res0.05_ann), ]
+all(rownames(res.all.sub) == rownames(all_groups_res0.05_ann))
+
+all_groups_res0.05_ann <- cbind(all_groups_res0.05_ann, res.all.sub)
+write.csv(all_groups_res0.05_ann, file = here("PD_PSM_level_analysis", "all_groups_res0.05.pair_wise_tests_added.csv"))
+
+table(all_groups_res0.05_ann$XPeptides.new)
+all_groups_res0.05_ann_one_hit_wonders <- all_groups_res0.05_ann[all_groups_res0.05_ann$XPeptides.new == 1, ]
+write.csv(all_groups_res0.05_ann_one_hit_wonders, file = here("PD_PSM_level_analysis", "all_groups_res0.05.pair_wise_tests_added.one_hit_wonders.csv"))
+all_groups_res0.05_ann_higher_confidence <- all_groups_res0.05_ann[all_groups_res0.05_ann$XPeptides.new > 1, ]
+write.csv(all_groups_res0.05_ann_higher_confidence, file = here("PD_PSM_level_analysis", "all_groups_res0.05.pair_wise_tests_added.atleast_2_peptide_matches.csv"))
+
+#Upset plot
+mydat <- as.data.frame(results)
+mydat <- abs(mydat)
+mydat <- mydat[which(rowSums(mydat) > 0), ]
+pdf(here("PD_PSM_level_analysis", "upset_plot.pdf"))
+upset(mydat, nsets = 6, order.by = "freq")
+dev.off()
+
+#Proteins that were expressed by only some groups
+prots <- rownames(all_groups_res)[is.na(all_groups_res$P.Value)]
+prots.dat <- exprs(proteins.norm.F)[prots, ]
+prots.dat[is.na(prots.dat)] <- 0
+prots.dat <- as.data.frame(prots.dat)
+prots.dat$Gene <- dat[match(rownames(prots.dat), dat$Accession), "Gene.Symbol"]
+prots.dat$Gene <- gsub("; ", "_", prots.dat$Gene)
+rownames(prots.dat) <- paste0(rownames(prots.dat), "_", prots.dat$Gene)
+prots.dat <- prots.dat[, -which(colnames(prots.dat) == "Gene")]
+prots.ann <- pData(proteins.norm.F)
+#prots.ann <- ann[sample.order, ]
+set.seed(111)
+column_ha <- HeatmapAnnotation(Regions = prots.ann$Region, RegionLR = prots.ann$RegionLR, BioRep = as.factor(prots.ann$BioRep))
+pdf(here("PD_PSM_level_analysis", "Proteins_with_missing_expression_in_any_one_group.heatmap.pdf"))
+Heatmap(as.matrix(prots.dat), col = colorRamp2(c(0, 2, 6), c("blue", "white", "red")), row_names_gp = grid::gpar(fontsize = 6), top_annotation = column_ha)
+dev.off()
+
+dat2 <- dat[dat$Accession %in% prots, ]
+dat2$XPeptides.new <- fData(proteins.norm.F)[match(dat2$Accession, rownames(fData(proteins.norm.F))), "Master.Protein.Accessions.nFeatures"] 
+write.csv(dat2, file = here("PD_PSM_level_analysis", "Proteins_with_missing_expression_in_any_one_group.csv"))
+```
+
+#Comparison with PD protein level analysis.
+```{r}
+pd_prot <- read.csv(here("PD_Protein_abundances_analysis", "between_regions", "all_groups_res0.05.pair_wise_tests_added.csv"), header = TRUE, row.names = 1)
+pd_psm <- all_groups_res0.05_ann
+
+venn(list(PD.proteins = rownames(pd_prot), PD.PSM.aggregated.to.proteins = rownames(pd_psm)))
+
+overlap <- rownames(pd_prot)[rownames(pd_prot) %in% rownames(pd_psm)]
+pd_prot_sub <- pd_prot[overlap, ]
+pd_psm_sub <- pd_psm[overlap, ]
+all(rownames(pd_prot_sub) == rownames(pd_psm_sub))
+mydat_prot <- pd_prot_sub[,1:6]
+colnames(mydat_prot) <- gsub("\\.+", "-", colnames(mydat_prot))
+mydat_prot$Accession <- rownames(mydat_prot)
+mydat_prot_melt <- melt(mydat_prot)
+colnames(mydat_prot_melt) <- c("Accession", "Comparison", "logFC.PD.Prot")
+
+mydat_psm <- pd_psm_sub[,1:6]
+colnames(mydat_psm) <- gsub("\\.+", "-", colnames(mydat_psm))
+mydat_psm$Accession <- rownames(mydat_psm)
+mydat_psm_melt <- melt(mydat_psm)
+colnames(mydat_psm_melt) <- c("Accession", "Comparison", "logFC.PD.PSM")
+
+all(mydat_prot_melt$Accession == mydat_psm_melt$Accession)
+all(mydat_prot_melt$Comparison == mydat_psm_melt$Comparison)
+
+mydat <- cbind(mydat_prot_melt, mydat_psm_melt[,"logFC.PD.PSM"])
+colnames(mydat)[4] <- "logFC.PD.PSM"
+ggplot(mydat, aes(x = logFC.PD.Prot, y = logFC.PD.PSM)) + geom_point(size = 0.5) + facet_wrap(~Comparison)
+```
+
+#Limma comparison between Left and right 
+```{r}
+Region <- "Nod"
+Region <- "Prox"
+Region <- "Dis"
+Region <- "Gas"
+
+prot.norm.sub <- proteins.norm.F[, proteins.norm.F$Region == Region]
+prot.norm.sub$RegionLR <- droplevels(prot.norm.sub$RegionLR)
+for.lr.PCA <- filterNA(prot.norm.sub)
+any(is.na(for.lr.PCA))
+which(apply(exprs(for.lr.PCA), 1, var)==0)
+for.lr.PCA <- for.lr.PCA[which(apply(exprs(for.lr.PCA), 1, var)!=0), ] #Remove features with zero variance. Throws error while scaling.
+lr.pca <- prcomp(t(exprs(for.lr.PCA)), scale = TRUE)
+fviz_pca_ind(lr.pca, habillage = for.lr.PCA$RegionLR, repel = TRUE, title = paste0(Region, " Left vs Right"))
+fviz_pca_ind(lr.pca, habillage = for.lr.PCA$BioRep, repel = TRUE, title = paste0(Region, " Biological replicates"))
+fviz_pca_ind(lr.pca, axes = c(2,3), habillage = for.lr.PCA$BioRep, repel = TRUE, title = paste0(Region, " Biological replicates"))
+
+prot.norm.sub.F <- filter_valids_LR(prot.norm.sub, groups = levels(prot.norm.sub$RegionLR), min_count = c(2, 2), at_least_one = FALSE)
+table(fData(prot.norm.sub.F)$KEEP)
+prot.norm.sub.F <- prot.norm.sub.F[fData(prot.norm.sub.F)$KEEP, ]
+
+#Right vs Left
+design <- model.matrix(~BioRep + RegionLR, data = pData(prot.norm.sub.F)) 
+#design <- model.matrix(~RegionLR, data = pData(prot.norm.sub.F))
+design
+fit <- lmFit(exprs(prot.norm.sub.F), design)
+fit2 <- eBayes(fit)
+results <- decideTests(fit2)
+summary(results)
+res <- topTable(fit2, coef = 3, number = Inf) #When BioRep used as a covariate
+#res <- topTable(fit2, coef = 2, number = Inf) 
+hist(res$P.Value)
+
+plot(res$AveExpr, res$logFC)
+
+res0.01 <- res[which(res$P.Value <= 0.01), ]
+dat1 <- dat[,1:24]
+dat1 <- dat1[dat1$Accession %in% rownames(res0.01), ]
+rownames(dat1) <- dat1$Accession
+dat1 <- dat1[rownames(res0.01), ]
+all(rownames(dat1) == rownames(res0.01))
+res0.01 <- cbind(res0.01, dat1) 
+
+res0.01$Accession <- rownames(res0.01)
+pdf(here("PD_PSM_level_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.plots.pdf")))
+par(mfrow = (c(2,2)))
+fviz_pca_ind(lr.pca, habillage = for.lr.PCA$RegionLR, repel = TRUE, title = paste0(Region, " Left vs Right"))
+fviz_pca_ind(lr.pca, habillage = for.lr.PCA$BioRep, repel = TRUE, title = paste0(Region, " Biological replicates"))
+fviz_pca_ind(lr.pca, axes = c(2,3), habillage = for.lr.PCA$BioRep, repel = TRUE, title = paste0(Region, " Biological replicates"))
+hist(res$P.Value, main = paste0(Region, " Right-vs-Left"))
+ggplot(res0.01, aes(x = logFC, y = -log10(P.Value), label = Gene.Symbol))  +  geom_point() + geom_text_repel(max.overlaps = 20) + geom_vline(xintercept = c(-1, 1)) + theme_classic() + ggtitle(paste0(Region, " Right-vs-Left"))
+dev.off()
+
+res0.01$XPeptides.new <- fData(prot.norm.sub.F)[match(rownames(res0.01), rownames(fData(prot.norm.sub.F))), "Master.Protein.Accessions.nFeatures"] 
+table(res0.01$XPeptides.new)
+write.csv(res0.01, here("PD_PSM_level_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.csv")))
+```
+
+#Comparison with PD protein level analysis.
+```{r}
+Region <- "Gas"
+for(Region in c("Nod", "Prox", "Dis", "Gas")) {
+  res.prot <- read.csv(here("PD_Protein_abundances_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.csv")), header = TRUE, row.names = 1)
+  res.psm <- read.csv(here("PD_PSM_level_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.csv")), header = TRUE, row.names = 1)
+
+  v.table <- venn(list(PD.proteins = rownames(res.prot), PD.PSM.aggregated.to.proteins = rownames(res.psm))) 
+  title(main = Region)
+
+  intersection <- attr(v.table, "intersections")$`PD.proteins:PD.PSM.aggregated.to.proteins`
+  cor(res.prot[intersection, "logFC"], res.psm[intersection, "logFC"])
+  plot(res.prot[intersection, "logFC"], res.psm[intersection, "logFC"])
+  cor(res.prot[intersection, "P.Value"], res.psm[intersection, "P.Value"])
+  plot(res.prot[intersection, "P.Value"], res.psm[intersection, "P.Value"])
+}
+```
+
+
+#Boxplots
+```{r}
+Region <- "Nod"
+for(Region in c("Nod", "Dis", "Prox", "Gas")) {
+  res.psm <- read.csv(here("PD_PSM_level_analysis", "Right-vs-Left", paste0(Region, "_RvsL.p0.01.csv")), header = TRUE, row.names = 1)
+  genes <- rownames(res.psm)
+  myplot(genes, Region, paste0(Region, "Right-vs-Left Genes with p-value <= 0.01"))
+}
+
+
+myplot <- function(genes, region, title) {
+  mydat <- proteins.norm[genes, proteins.norm$Region == region]
+  mydat <- as.data.frame(exprs(mydat))
+  mydat$Protein <- rownames(mydat)
+  mydat_long <- melt(mydat)
+  colnames(mydat_long) <- c("Protein", "Sample", "normalized_exp")
+  mydat_long$RegionLR <- samples[match(mydat_long$Sample, samples$Sample), "RegionLR"]
+  mydat_long$Gene <- dat[match(mydat_long$Protein, dat$Accession), "Gene.Symbol"]
+  mydat_long$Gene_name <- paste0(mydat_long$Protein, "_", mydat_long$Gene)
+  pdf(here("PD_PSM_level_analysis", "Right-vs-Left", paste0(region, ".pdf")), height = 20, width = 25)
+  print(ggplot(mydat_long, aes(x = RegionLR, y = normalized_exp, col = RegionLR)) + geom_boxplot(outlier.shape = NA) + geom_point(aes(x =RegionLR, y = normalized_exp), size = 0.7)+ facet_wrap(~Gene_name) + theme_bw() + theme(axis.text.x = element_text(angle = 90)) + ggtitle(title))
+  dev.off()
+}
+```
